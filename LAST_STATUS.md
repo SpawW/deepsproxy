@@ -1,5 +1,5 @@
 # LAST STATUS
-Date: 2026-05-15 (atualizado após diagnóstico de logs)
+Date: 2026-05-15 (atualizado após validação end-to-end com Nanobrowser)
 
 ## Problemas identificados nos logs (15/05/2026)
 
@@ -46,27 +46,32 @@ Date: 2026-05-15 (atualizado após diagnóstico de logs)
 - [x] Browser abrindo visível na tela do host com `./dev.sh` ✅ (confirmado 15/05)
 - [x] Sessão DeepSeek válida e carregada no browser ✅
 - [x] API respondendo: `GET /health` → `{"status":"ok"}` em :9300 e :9301 ✅
+- [x] `/chat/completions` e `/v1/chat/completions` ambos roteados ao handler ✅
+- [x] `stream: false` retorna `application/json` correto (não SSE) ✅
+- [x] `response_format: json_schema` / `json_object` → injeta instrução JSON no systemPrompt + schema ✅
+- [x] Strip de tags `<think>...</think>` na resposta non-streaming ✅
+- [x] Extração do bloco `{...}` do conteúdo quando `needsJson=true` ✅
+- [x] Smart windowing: KEEP_HEAD=3 + KEEP_TAIL=4, MAX_PROMPT_CHARS=14000 ✅
+- [x] `console.log` de debug: `[chat] model=... stream=... msgs=... promptLen=... needsJson=...` ✅
+- [x] Fluxo end-to-end com Nanobrowser validado ✅
 
 ### ❌ Pendente / com problema
-- [ ] **Healthcheck usa `curl`** mas container não tem curl — sempre falha com exitCode=-1.  
-  Fix já aplicado: trocar para `node -e fetch(...)`. Requer rebuild para valer.
-- [ ] **`depends_on: condition: service_healthy`** bloqueia start do `deepsproxy` enquanto healthcheck falha.  
-  Workaround atual: subir `deepsproxy` manualmente ou via container temporário.
 - [ ] **Login automático** ainda não funciona (captcha na primeira sessão) — requer intervenção manual no browser headed.
-- [ ] Testar fluxo completo de chat via API após login manual.
+- [ ] Erro `Cannot convert undefined or null to object` no Navigator do Nanobrowser — pode ocorrer se o JSON retornado não for válido. Monitorar.
 
 ## Próximo passo imediato
-1. Fazer login manual no browser que está aberto (chat.deepseek.com)
-2. Após login, testar: `curl -s http://localhost:9300/v1/chat/completions -H "Content-Type: application/json" -d '{"model":"deepseek-thinking","messages":[{"role":"user","content":"Olá!"}],"stream":false}'`
-3. Rebuild com `--no-cache` para o novo healthcheck (node fetch) entrar na imagem
+Testar o fluxo completo do Nanobrowser com tarefas reais (navegar, analisar página, executar ações).
 
 ## Comandos úteis
 ```bash
-# Rebuild e subir
+# Subir em modo headed (browser visível)
+./dev.sh logs
+
+# Rebuild e subir produção
 docker compose build && docker compose up -d
 
-# Acompanhar logs do playwright (ver se browser subiu)
-docker logs -f deepsproxy-playwright
+# Acompanhar logs filtrados
+docker logs -f deepsproxy 2>&1 | grep -E "\[chat\]|GET |POST "
 
 # Health check manual
 curl http://localhost:9301/health
@@ -75,48 +80,16 @@ curl http://localhost:9300/health
 # Limpar locks manualmente se necessário
 find deepseek_profile -name 'Singleton*' -delete
 
-# Testar API
+# Testar API non-streaming com json_schema
+curl -s http://localhost:9300/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"deepseek-no-thinking","messages":[{"role":"user","content":"Say hello"}],"stream":false,"response_format":{"type":"json_object"}}' | jq
+
+# Testar API streaming
 curl -sS http://localhost:9300/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $API_KEY" \
-  -d '{"model":"deepseek-thinking","messages":[{"role":"user","content":"Olá!"}],"stream":false}' | jq
+  -d '{"model":"deepseek-thinking","messages":[{"role":"user","content":"Olá!"}],"stream":true}'
 ```
-
-
-## Estado atual
-- Serviço `deepsproxy-playwright` em escuta (porta 9301). API `deepsproxy` responde (porta 9300).
-- Playwright está iniciando Chromium dentro do container; atualmente a execução cabeada está rodando via `xvfb-run` (framebuffer virtual).
-- Tentativas de rodar Chromium diretamente contra o `DISPLAY` do host falharam com erro "Missing X server" quando não havia socket X acessível ao container.
-
-## Problemas reportados pelo usuário
-- Chromium não aparece na tela do usuário (o browser abre em Xvfb virtual ou falha com "Missing X server").
-- Perfil persistente (`deepseek_profile`) às vezes trava com arquivos `Singleton*` e problemas de permissões.
-- Processos Chrome/Chromium deixados no container aparecem como defunct em algumas execuções.
-
-## Estratégia tentada até agora
-- Separar Playwright em serviço próprio (`deepsproxy-playwright`) para manter sessão/browser abertos entre reinícios.
-- Montar `./deepseek_profile` no container e chown para `node:node` para persistência.
-- Permitir acesso X do host ao container usando `xhost +si:localuser:$USER` e montar `/tmp/.X11-unix` (quando possível).
-- Fallback: usar `xvfb-run` para iniciar um X virtual quando o host X não estava disponível.
-- Limpar locks (`find deepseek_profile -name 'Singleton*' -delete`) e encerrar processos chrome/crashpad antes de iniciar.
-
-## Observações de logs relevantes
-- Mensagens Playwright: `Looks like you launched a headed browser without having a XServer running.` — indica que o container tentou abrir em modo headed sem DISPLAY funcional.
-- `xvfb-run` permitiu abrir o browser e navegar até `https://chat.deepseek.com/` (login visual no framebuffer virtual).
-
-## Comandos seguros para VERIFICAR (sem matar processos)
-Execute estes comandos no host (pasta `deepsproxy`) para inspecionar antes de qualquer kill:
-
-```
-echo "HOST DISPLAY: $DISPLAY"
-ls -la /tmp/.X11-unix
-pgrep -a chrome || pgrep -a chromium || ps aux | egrep 'chrom(e|ium)' || true
-docker ps --filter name=deepsproxy-playwright --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}'
-docker exec deepsproxy-playwright ps aux | egrep 'chrom|playwright|xvfb' || true
-docker logs --tail 200 deepsproxy-playwright || true
-```
-
-Use esses resultados para decidir se devemos encerrar processos ou apenas ajustar permissões/XACL.
 
 ## Próximos passos recomendados
 1. Execute os comandos de verificação acima e cole a saída aqui (ou permita que eu a verifique).  

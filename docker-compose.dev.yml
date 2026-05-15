@@ -1,0 +1,7 @@
+services:
+  deepsproxy:
+    network_mode: host
+    environment:
+      - PLAYWRIGHT_REMOTE_URL=http://localhost:9301
+  playwright:
+    network_mode: host

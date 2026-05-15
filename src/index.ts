@@ -22,6 +22,13 @@ export const app = new Hono();
 app.use('*', cors());
 
 app.use('*', async (c, next) => {
+  const start = Date.now();
+  await next();
+  const ms = Date.now() - start;
+  console.log(`[${new Date().toISOString()}] ${c.req.method} ${c.req.path} → ${c.res.status} (${ms}ms)`);
+});
+
+app.use('*', async (c, next) => {
   const apiKey = process.env.API_KEY;
   if (apiKey) {
     const authHeader = c.req.header('Authorization');

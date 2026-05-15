@@ -27,8 +27,9 @@ export async function chatCompletions(c: Context) {
     const messages = body.messages || [];
     let systemPrompt = '';
     
-    for (let i = 0; i < messages.length; i++) {
-      const msg = messages[i];
+    // Build non-system messages list
+    const nonSystemMsgs: Array<{ role: string; contentStr: string; orig: any }> = [];
+    for (const msg of messages) {
       let contentStr = '';
       if (Array.isArray(msg.content)) {
         contentStr = msg.content.map((c: any) => c.text || JSON.stringify(c)).join('\n');
@@ -40,25 +41,47 @@ export async function chatCompletions(c: Context) {
 
       if (msg.role === 'system') {
         systemPrompt += contentStr + '\n\n';
-      } else if (i === messages.length - 1) {
-        if (msg.role === 'user') {
-          prompt += `User: ${contentStr}\n\n`;
-        } else if (msg.role === 'assistant') {
-          let assistantContent = contentStr;
-          if ((msg as any).reasoning_content) {
-            assistantContent = `<think>\n${(msg as any).reasoning_content}\n</think>\n${assistantContent}`;
-          }
-          if (msg.tool_calls && Array.isArray(msg.tool_calls)) {
-             for (const tc of msg.tool_calls) {
-               let args = tc.function?.arguments || '{}';
-               if (typeof args !== 'string') args = JSON.stringify(args);
-               assistantContent += `\n<tool_call>{"name": "${tc.function?.name}", "arguments": ${args}}</tool_call>`;
-             }
-          }
-          prompt += `Assistant: ${assistantContent.trim()}\n\n`;
-        } else if (msg.role === 'tool' || msg.role === 'function') {
-          prompt += `Tool Response (${msg.name || 'tool'}): ${contentStr}\n\n`;
+      } else {
+        nonSystemMsgs.push({ role: msg.role, contentStr, orig: msg });
+      }
+    }
+
+    // Smart windowing: keep first 3 + last 4 messages to avoid exceeding DeepSeek textarea limits (~15k chars)
+    const MAX_PROMPT_CHARS = 14000;
+    const KEEP_HEAD = 3; // always include (task is usually here)
+    const KEEP_TAIL = 4; // always include (page content is usually here)
+    let selectedMsgs = nonSystemMsgs;
+    if (nonSystemMsgs.length > KEEP_HEAD + KEEP_TAIL) {
+      const headMsgs = nonSystemMsgs.slice(0, KEEP_HEAD);
+      const tailMsgs = nonSystemMsgs.slice(-KEEP_TAIL);
+      const headLen = headMsgs.reduce((s, m) => s + m.contentStr.length, 0);
+      const tailLen = tailMsgs.reduce((s, m) => s + m.contentStr.length, 0);
+      if (headLen + tailLen > MAX_PROMPT_CHARS) {
+        // Still too long — use only last message (page content)
+        selectedMsgs = nonSystemMsgs.slice(-1);
+      } else {
+        selectedMsgs = [...headMsgs, ...tailMsgs];
+      }
+    }
+
+    for (const { role, contentStr, orig } of selectedMsgs) {
+      if (role === 'user') {
+        prompt += `User: ${contentStr}\n\n`;
+      } else if (role === 'assistant') {
+        let assistantContent = contentStr;
+        if (orig.reasoning_content) {
+          assistantContent = `<think>\n${orig.reasoning_content}\n</think>\n${assistantContent}`;
         }
+        if (orig.tool_calls && Array.isArray(orig.tool_calls)) {
+          for (const tc of orig.tool_calls) {
+            let args = tc.function?.arguments || '{}';
+            if (typeof args !== 'string') args = JSON.stringify(args);
+            assistantContent += `\n<tool_call>{"name": "${tc.function?.name}", "arguments": ${args}}</tool_call>`;
+          }
+        }
+        prompt += `Assistant: ${assistantContent.trim()}\n\n`;
+      } else if (role === 'tool' || role === 'function') {
+        prompt += `Tool Response (${orig.name || 'tool'}): ${contentStr}\n\n`;
       }
     }
 
@@ -86,6 +109,20 @@ export async function chatCompletions(c: Context) {
       }
     }
 
+    // Handle response_format: json_schema / json_object
+    const responseFormat = (body as any).response_format;
+    let needsJson = false;
+    if (responseFormat) {
+      if (responseFormat.type === 'json_schema' || responseFormat.type === 'json_object') {
+        needsJson = true;
+        let jsonInstruction = '\n\nYou MUST respond with a valid JSON object and NOTHING else — no markdown fences, no explanation, no extra text. Just the raw JSON.';
+        if (responseFormat.type === 'json_schema' && responseFormat.json_schema?.schema) {
+          jsonInstruction += `\n\nThe JSON must conform to this schema:\n${JSON.stringify(responseFormat.json_schema.schema, null, 2)}`;
+        }
+        systemPrompt += jsonInstruction;
+      }
+    }
+
     const finalPrompt = systemPrompt ? `${systemPrompt}\n${prompt}` : prompt;
 
     const isThinkingModel = !body.model.includes('no-thinking');
@@ -93,6 +130,8 @@ export async function chatCompletions(c: Context) {
     // A session is new if it doesn't have any assistant messages yet.
     // This handles cases where the first request has [System, User] messages.
     const isNewSession = !messages.some(m => m.role === 'assistant');
+
+    console.log(`[chat] model=${body.model} stream=${isStream} msgs=${messages.length} selected=${selectedMsgs.length} promptLen=${finalPrompt.length} needsJson=${needsJson}`);
 
     // Empty response retry logic
     let stream: ReadableStream;
@@ -269,8 +308,18 @@ export async function chatCompletions(c: Context) {
         }
       });
 
+      // Strip <think> tags from content
+      content = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+
+      // Extract JSON block if response_format requires it
+      if (needsJson && content) {
+        const jsonMatch = content.match(/\{[\s\S]*\}/);
+        if (jsonMatch) content = jsonMatch[0];
+      }
+
+      console.log(`[chat] non-stream response: contentLen=${content.length} toolCalls=${toolCallsResult.length} tokens=${completionTokens}`);
+
       const usage = {
-        prompt_tokens: promptTokens,
         completion_tokens: completionTokens,
         total_tokens: promptTokens + completionTokens,
         prompt_tokens_details: { cached_tokens: 0 }

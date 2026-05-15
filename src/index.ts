@@ -13,7 +13,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { chatCompletions } from './routes/chat.ts';
 import * as dotenv from 'dotenv';
-import { initPlaywright } from './services/playwright.ts';
+import { initPlaywright, closePlaywright } from './services/playwright.ts';
 
 dotenv.config();
 
@@ -37,8 +37,9 @@ app.use('*', async (c, next) => {
 // Basic health check
 app.get('/health', (c) => c.json({ status: 'ok' }));
 
-// OpenAI compatible routes
+// OpenAI compatible routes (with and without /v1 prefix)
 app.post('/v1/chat/completions', chatCompletions);
+app.post('/chat/completions', chatCompletions);
 
 app.get('/v1/models', (c) => {
   return c.json({
@@ -70,7 +71,10 @@ app.get('/v1/models', (c) => {
 import { fileURLToPath } from 'url';
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  initPlaywright().then(() => {
+  const remote = process.env.PLAYWRIGHT_REMOTE_URL;
+  const headless = process.env.PLAYWRIGHT_HEADLESS === 'false' ? false : true;
+  const maybeInit = remote ? Promise.resolve() : initPlaywright(headless);
+  maybeInit.then(() => {
     console.log('Playwright initialized.');
     const port = process.env.PORT ? parseInt(process.env.PORT) : 3000;
     console.log(`Server is running on port ${port}`);
@@ -83,4 +87,19 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
     console.error('Failed to initialize playwright:', err);
     process.exit(1);
   });
+  
+  // Gracefully handle termination signals to allow Playwright to persist profile
+  const gracefulShutdown = async (signal: string) => {
+    console.log(`Received ${signal}, shutting down...`);
+    try {
+      await closePlaywright();
+      console.log('Playwright closed.');
+    } catch (e) {
+      console.error('Error closing Playwright:', e);
+    }
+    process.exit(0);
+  };
+
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 }

@@ -10,10 +10,30 @@
 
 import { chromium, BrowserContext, Page } from 'playwright';
 import path from 'path';
+import { existsSync, readdirSync, rmSync } from 'fs';
 
 let context: BrowserContext | null = null;
 export let activePage: Page | null = null;
 let currentHeaders: Record<string, string> = {};
+
+/**
+ * Removes Chrome profile lock files (Singleton*) left by crashed/killed processes.
+ * These locks prevent a new Chromium instance from using the same profile when the
+ * previous container had a different hostname (exitCode=21).
+ */
+function clearProfileLocks(profilePath: string) {
+  if (!existsSync(profilePath)) return;
+  try {
+    for (const f of readdirSync(profilePath)) {
+      if (f.startsWith('Singleton')) {
+        rmSync(path.join(profilePath, f), { force: true });
+        console.log(`[playwright] Removed stale lock: ${f}`);
+      }
+    }
+  } catch (e) {
+    console.warn('[playwright] Could not clear profile locks:', e);
+  }
+}
 
 export async function initPlaywright(headless = true) {
   if (process.env.TEST_MOCK_PLAYWRIGHT) return;
@@ -22,11 +42,31 @@ export async function initPlaywright(headless = true) {
   }
 
   const profilePath = path.resolve('deepseek_profile');
-  
-  context = await chromium.launchPersistentContext(profilePath, {
-    headless,
-    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
-  });
+
+  // Clear stale Singleton lock files before launch.
+  // These are left behind when the container crashes or is killed, causing
+  // exitCode=21 ("profile in use by another computer") on the next start.
+  clearProfileLocks(profilePath);
+
+  try {
+    context = await chromium.launchPersistentContext(profilePath, {
+      headless,
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+    });
+  } catch (err: any) {
+    // If launch still fails due to a lock (race condition or nested lock files),
+    // clear locks and retry once before giving up.
+    if (String(err).includes('profile') || String(err).includes('Singleton') || String(err).includes('exitCode=21')) {
+      console.warn('[playwright] Launch failed due to profile lock, clearing and retrying...');
+      clearProfileLocks(profilePath);
+      context = await chromium.launchPersistentContext(profilePath, {
+        headless,
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+      });
+    } else {
+      throw err;
+    }
+  }
 
   // Keep an active page to fetch PoW headers on demand
   activePage = await context.newPage();

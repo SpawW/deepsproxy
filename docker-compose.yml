@@ -1,12 +1,51 @@
-version: '3.8'
 services:
   deepsproxy:
+    container_name: deepsproxy
     build: .
     ports:
-      - "3000:3000"
+      - "${PORT:-3000}:${PORT:-3000}"
+    env_file:
+      - .env
     environment:
-      - PORT=3000
-      - API_KEY=sua_api_key_aqui
+      - PORT=${PORT:-3000}
+      - API_KEY=${API_KEY}
+      - PLAYWRIGHT_REMOTE_URL=http://playwright:9301
+      - PLAYWRIGHT_HEADLESS=${PLAYWRIGHT_HEADLESS:-true}
+      - PLAYWRIGHT_TIMEOUT=${PLAYWRIGHT_TIMEOUT:-30000}
+      - DISPLAY=${DISPLAY}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
     volumes:
       - ./deepseek_profile:/app/deepseek_profile
+      - /tmp/.X11-unix:/tmp/.X11-unix
+    devices:
+      - /dev/dri:/dev/dri
+    depends_on:
+      playwright:
+        condition: service_healthy
+    restart: unless-stopped
+  playwright:
+    container_name: deepsproxy-playwright
+    build: .
+    env_file:
+      - .env
+    environment:
+      - PLAYWRIGHT_HEADLESS=${PLAYWRIGHT_HEADLESS:-true}
+      - PLAYWRIGHT_SERVICE_PORT=9301
+      - DISPLAY=${DISPLAY}
+      - XAUTHORITY=/tmp/.docker.xauth
+    command: ["node", "dist/playwright-service.js"]
+    volumes:
+      - ./deepseek_profile:/app/deepseek_profile
+      - /tmp/.X11-unix:/tmp/.X11-unix
+      - /tmp/.docker.xauth:/tmp/.docker.xauth:rw
+    devices:
+      - /dev/dri:/dev/dri
+    ports:
+      - "9301:9301"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:9301/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 10s
+      retries: 20
+      start_period: 60s
     restart: unless-stopped

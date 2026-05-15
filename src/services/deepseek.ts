@@ -8,7 +8,7 @@
  * Modified By: Pedro Farias
  */
 
-import { getDeepSeekHeaders } from './playwright.ts';
+import { getDeepSeekHeaders } from './playwright-client.ts';
 
 // In-memory state to track the last message ID per session to avoid overwriting
 // Use globalThis to ensure it survives module reloads in some test environments

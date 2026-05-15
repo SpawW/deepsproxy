@@ -113,11 +113,192 @@ export async function chatCompletions(c: Context) {
       }
     }
 
+    const completionId = 'chatcmpl-' + uuidv4();
+    const promptTokens = Math.ceil(finalPrompt.length / 3.5);
+
+    // --- Shared stream parser ---
+    // Parses the raw DeepSeek SSE stream and calls onChunk for each emitted piece.
+    // onChunk receives: (type: 'reasoning'|'content'|'tool_call'|'done', payload)
+    const parseDeepSeekStream = async (
+      rawStream: ReadableStream,
+      onChunk: (type: string, payload: any) => Promise<void>
+    ) => {
+      const reader = rawStream.getReader();
+      const decoder = new TextDecoder();
+      let currentAppendPath = '';
+      let contentEmitBuffer = '';
+      let insideTool = false;
+      let toolCallCount = 0;
+      let buf = '';
+      const TOOL_START = '<tool_call>';
+      const TOOL_END = '</tool_call>';
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith('data: ')) continue;
+          const dataStr = trimmed.slice(6);
+          if (dataStr === '[DONE]') { await onChunk('done', null); continue; }
+
+          try {
+            const chunk = JSON.parse(dataStr);
+
+            // session tracking
+            let dsMessageId: any = null;
+            if (chunk.response_message_id) dsMessageId = chunk.response_message_id;
+            else if (chunk.v?.response?.message_id) dsMessageId = chunk.v.response.message_id;
+            else if (chunk.v?.message_id) dsMessageId = chunk.v.message_id;
+            else if (chunk.message_id) dsMessageId = chunk.message_id;
+            if (dsMessageId) updateSessionParent(uiSessionId, dsMessageId);
+
+            if (typeof chunk.p === 'string') {
+              currentAppendPath = chunk.p;
+              if (chunk.p === 'response/accumulated_token_usage' && typeof chunk.v === 'number') {
+                await onChunk('usage', chunk.v);
+              }
+            }
+
+            let vStr = '';
+            let foundStr = false;
+            let isThinkingChunk = false;
+
+            if (typeof chunk.v === 'string') {
+              vStr = chunk.v; foundStr = true;
+            } else if (chunk.v && typeof chunk.v === 'object') {
+              if (chunk.v.response?.fragments?.length > 0) {
+                const frag = chunk.v.response.fragments[0];
+                if (typeof frag.content === 'string') {
+                  vStr = frag.content; foundStr = true;
+                  currentAppendPath = frag.type === 'THINK' ? 'response/thinking_content' : 'response/content';
+                }
+              } else if (Array.isArray(chunk.v) && chunk.v.length > 0) {
+                const firstObj = chunk.v[0];
+                if (typeof firstObj.content === 'string') {
+                  vStr = firstObj.content; foundStr = true;
+                  currentAppendPath = firstObj.type === 'THINK' ? 'response/thinking_content' : 'response/content';
+                }
+              }
+            }
+
+            if (currentAppendPath.includes('thinking_content') || currentAppendPath.includes('THINK')) {
+              isThinkingChunk = true;
+            }
+
+            if (!foundStr || vStr === '' || vStr === 'FINISHED') continue;
+
+            if (isThinkingChunk) {
+              await onChunk('reasoning', vStr);
+            } else {
+              contentEmitBuffer += vStr;
+              while (contentEmitBuffer.length > 0) {
+                if (!insideTool) {
+                  const startIdx = contentEmitBuffer.indexOf(TOOL_START);
+                  if (startIdx !== -1) {
+                    const textToEmit = contentEmitBuffer.substring(0, startIdx);
+                    if (textToEmit && toolCallCount === 0) await onChunk('content', textToEmit);
+                    insideTool = true;
+                    contentEmitBuffer = contentEmitBuffer.substring(startIdx + TOOL_START.length);
+                    continue;
+                  } else {
+                    let flushIndex = contentEmitBuffer.length;
+                    for (let i = 1; i <= TOOL_START.length; i++) {
+                      if (contentEmitBuffer.endsWith(TOOL_START.substring(0, i))) {
+                        flushIndex = contentEmitBuffer.length - i; break;
+                      }
+                    }
+                    const textToEmit = contentEmitBuffer.substring(0, flushIndex);
+                    if (textToEmit && toolCallCount === 0) await onChunk('content', textToEmit);
+                    contentEmitBuffer = contentEmitBuffer.substring(flushIndex);
+                    break;
+                  }
+                } else {
+                  const endIdx = contentEmitBuffer.indexOf(TOOL_END);
+                  if (endIdx !== -1) {
+                    const toolJsonStr = contentEmitBuffer.substring(0, endIdx).trim();
+                    try {
+                      const toolCallObj = robustParseJSON(toolJsonStr);
+                      if (!toolCallObj) throw new Error('empty');
+                      await onChunk('tool_call', { index: toolCallCount, obj: toolCallObj });
+                      toolCallCount++;
+                    } catch {
+                      if (toolCallCount === 0) await onChunk('content', TOOL_START + toolJsonStr + TOOL_END);
+                    }
+                    insideTool = false;
+                    contentEmitBuffer = contentEmitBuffer.substring(endIdx + TOOL_END.length);
+                  } else { break; }
+                }
+              }
+            }
+          } catch { /* ignore parse error */ }
+        }
+      }
+      // flush remaining
+      if (!insideTool && contentEmitBuffer.length > 0) {
+        await onChunk('content', contentEmitBuffer);
+      }
+    };
+
+    // --- Non-streaming path: collect and return JSON ---
+    if (!isStream) {
+      let reasoningContent = '';
+      let content = '';
+      const toolCallsResult: any[] = [];
+      let completionTokens = 0;
+
+      await parseDeepSeekStream(stream!, async (type, payload) => {
+        if (type === 'reasoning') reasoningContent += payload;
+        else if (type === 'content') content += payload;
+        else if (type === 'usage') completionTokens = payload;
+        else if (type === 'tool_call') {
+          const { index, obj } = payload;
+          toolCallsResult.push({
+            index,
+            id: 'call_' + uuidv4(),
+            type: 'function',
+            function: {
+              name: obj.name || '',
+              arguments: typeof obj.arguments === 'object' ? JSON.stringify(obj.arguments) : String(obj.arguments || '')
+            }
+          });
+        }
+      });
+
+      const usage = {
+        prompt_tokens: promptTokens,
+        completion_tokens: completionTokens,
+        total_tokens: promptTokens + completionTokens,
+        prompt_tokens_details: { cached_tokens: 0 }
+      };
+
+      const message: any = { role: 'assistant', content };
+      if (reasoningContent) message.reasoning_content = reasoningContent;
+      if (toolCallsResult.length > 0) message.tool_calls = toolCallsResult;
+
+      return c.json({
+        id: completionId,
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: body.model,
+        choices: [{
+          index: 0,
+          message,
+          finish_reason: toolCallsResult.length > 0 ? 'tool_calls' : 'stop',
+          logprobs: null
+        }],
+        usage
+      });
+    }
+
+    // --- Streaming path ---
     c.header('Content-Type', 'text/event-stream');
     c.header('Cache-Control', 'no-cache');
     c.header('Connection', 'keep-alive');
-
-    const completionId = 'chatcmpl-' + uuidv4();
 
     return honoStream(c, async (streamWriter: any) => {
       const writeEvent = async (data: any) => {
@@ -125,271 +306,68 @@ export async function chatCompletions(c: Context) {
       };
 
       const makeChoice = (delta: any, finishReason: string | null = null) => ({
-        index: 0,
-        delta,
-        logprobs: null,
-        finish_reason: finishReason
+        index: 0, delta, logprobs: null, finish_reason: finishReason
       });
 
-      // Send initial chunk
       await writeEvent({
-        id: completionId,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: body.model,
+        id: completionId, object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000), model: body.model,
         choices: [makeChoice({ role: 'assistant', content: '' })]
       });
 
-      const reader = stream.getReader();
-      const decoder = new TextDecoder();
-      
-      let inThinkingState = false;
-      let thinkingFragments: Record<string, boolean> = {};
-      let currentFragIndex = 0;
-      let currentAppendPath = '';
-      
-      let reasoningBuffer = '';
-      let contentEmitBuffer = '';
-      let insideTool = false;
-      let emittedToolCallCount = 0;
-      const TOOL_START = '<tool_call>';
-      const TOOL_END = '</tool_call>';
-
-      let buffer = '';
       let completionTokens = 0;
-      const promptTokens = Math.ceil(finalPrompt.length / 3.5);
+      let emittedToolCallCount = 0;
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || '';
-
-        for (const line of lines) {
-          const trimmed = line.trim();
-          if (!trimmed || !trimmed.startsWith('data: ')) continue;
-          
-          const dataStr = trimmed.slice(6);
-          if (dataStr === '[DONE]') {
-            await streamWriter.write('data: [DONE]\n\n');
-            continue;
-          }
-
-          try {
-            const chunk = JSON.parse(dataStr);
-
-            // Extract message_id for session tracking to avoid overwriting messages
-            let dsMessageId: any = null;
-            if (chunk.response_message_id) {
-              dsMessageId = chunk.response_message_id;
-            } else if (chunk.v && typeof chunk.v === 'object') {
-              if (chunk.v.response && chunk.v.response.message_id) {
-                dsMessageId = chunk.v.response.message_id;
-              } else if (chunk.v.message_id) {
-                dsMessageId = chunk.v.message_id;
-              }
-            } else if (chunk.message_id) {
-              dsMessageId = chunk.message_id;
-            }
-
-            if (dsMessageId) {
-              updateSessionParent(uiSessionId, dsMessageId);
-            }
-
-            let vStr = '';
-            let foundStr = false;
-            let isThinkingChunk = false;
-
-            if (typeof chunk.p === 'string') {
-              currentAppendPath = chunk.p;
-              if (chunk.p === 'response/accumulated_token_usage' && typeof chunk.v === 'number') {
-                completionTokens = chunk.v;
-              }
-            }
-
-            // Extract string value
-            if (typeof chunk.v === 'string') {
-              vStr = chunk.v;
-              foundStr = true;
-            } else if (chunk.v && typeof chunk.v === 'object') {
-              // Handle old fragments format if it ever occurs
-              if (chunk.v.response && chunk.v.response.fragments && chunk.v.response.fragments.length > 0) {
-                const frag = chunk.v.response.fragments[0];
-                if (typeof frag.content === 'string') {
-                  vStr = frag.content;
-                  foundStr = true;
-                  currentAppendPath = frag.type === 'THINK' ? 'response/thinking_content' : 'response/content';
+      await parseDeepSeekStream(stream!, async (type, payload) => {
+        if (type === 'reasoning') {
+          await writeEvent({
+            id: completionId, object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000), model: body.model,
+            choices: [makeChoice({ reasoning_content: payload })]
+          });
+        } else if (type === 'content') {
+          await writeEvent({
+            id: completionId, object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000), model: body.model,
+            choices: [makeChoice({ content: payload })]
+          });
+        } else if (type === 'usage') {
+          completionTokens = payload;
+        } else if (type === 'tool_call') {
+          const { index, obj } = payload;
+          await writeEvent({
+            id: completionId, object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000), model: body.model,
+            choices: [makeChoice({
+              tool_calls: [{
+                index,
+                id: 'call_' + uuidv4(),
+                type: 'function',
+                function: {
+                  name: obj.name || '',
+                  arguments: typeof obj.arguments === 'object' ? JSON.stringify(obj.arguments) : String(obj.arguments || '')
                 }
-              } else if (Array.isArray(chunk.v) && chunk.v.length > 0) {
-                const firstObj = chunk.v[0];
-                if (typeof firstObj.content === 'string') {
-                  vStr = firstObj.content;
-                  foundStr = true;
-                  currentAppendPath = firstObj.type === 'THINK' ? 'response/thinking_content' : 'response/content';
-                }
-              }
-            }
-
-            // Determine if it's thinking based on the current path
-            if (currentAppendPath.includes('thinking_content') || currentAppendPath.includes('THINK')) {
-              isThinkingChunk = true;
-            }
-
-            if (foundStr && vStr !== '') {
-              if (vStr === 'FINISHED') continue;
-
-              const delta: ChoiceDelta = {};
-              
-              // Map chunk to either reasoning_content or content
-              if (isThinkingChunk) {
-                inThinkingState = true;
-                reasoningBuffer += vStr;
-                delta.reasoning_content = vStr;
-
-                await writeEvent({
-                  id: completionId,
-                  object: 'chat.completion.chunk',
-                  created: Math.floor(Date.now() / 1000),
-                  model: body.model,
-                  choices: [makeChoice(delta)]
-                });
-              } else {
-                inThinkingState = false;
-                contentEmitBuffer += vStr;
-
-                while (contentEmitBuffer.length > 0) {
-                  if (!insideTool) {
-                    const startIdx = contentEmitBuffer.indexOf(TOOL_START);
-                    if (startIdx !== -1) {
-                      // Found tool start. Emit everything before it as text
-                      const textToEmit = contentEmitBuffer.substring(0, startIdx);
-                      if (textToEmit && emittedToolCallCount === 0) {
-                        await writeEvent({
-                          id: completionId,
-                          object: 'chat.completion.chunk',
-                          created: Math.floor(Date.now() / 1000),
-                          model: body.model,
-                          choices: [makeChoice({ content: textToEmit })]
-                        });
-                      }
-                      insideTool = true;
-                      contentEmitBuffer = contentEmitBuffer.substring(startIdx + TOOL_START.length);
-                      continue; // re-evaluate loop for tool end
-                    } else {
-                      // No full start tag. Check for partial match at the end
-                      let flushIndex = contentEmitBuffer.length;
-                      for (let i = 1; i <= TOOL_START.length; i++) {
-                        if (contentEmitBuffer.endsWith(TOOL_START.substring(0, i))) {
-                          flushIndex = contentEmitBuffer.length - i;
-                          break;
-                        }
-                      }
-                      
-                      const textToEmit = contentEmitBuffer.substring(0, flushIndex);
-                      if (textToEmit && emittedToolCallCount === 0) {
-                        await writeEvent({
-                          id: completionId,
-                          object: 'chat.completion.chunk',
-                          created: Math.floor(Date.now() / 1000),
-                          model: body.model,
-                          choices: [makeChoice({ content: textToEmit })]
-                        });
-                      }
-                      contentEmitBuffer = contentEmitBuffer.substring(flushIndex);
-                      break; // wait for more chunks
-                    }
-                  } else {
-                    // Inside tool
-                    const endIdx = contentEmitBuffer.indexOf(TOOL_END);
-                    if (endIdx !== -1) {
-                      let toolJsonStr = contentEmitBuffer.substring(0, endIdx).trim();
-                      try {
-                        const toolCallObj = robustParseJSON(toolJsonStr);
-                        if (!toolCallObj) throw new Error('Empty tool call');
-                        
-                        const toolId = 'call_' + uuidv4();
-                        
-                        await writeEvent({
-                          id: completionId,
-                          object: 'chat.completion.chunk',
-                          created: Math.floor(Date.now() / 1000),
-                          model: body.model,
-                          choices: [makeChoice({
-                            tool_calls: [{
-                              index: emittedToolCallCount,
-                              id: toolId,
-                              type: 'function',
-                              function: {
-                                name: toolCallObj.name || '',
-                                arguments: typeof toolCallObj.arguments === 'object'
-                                  ? JSON.stringify(toolCallObj.arguments)
-                                  : String(toolCallObj.arguments || '')
-                              }
-                            }]
-                          })]
-                        });
-                        emittedToolCallCount++;
-                      } catch (e) {
-                        // Failed to parse tool call JSON, emit as regular text
-                        if (emittedToolCallCount === 0) {
-                          await writeEvent({
-                            id: completionId,
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: body.model,
-                            choices: [makeChoice({ content: TOOL_START + toolJsonStr + TOOL_END })]
-                          });
-                        }
-                      }
-                      
-                      insideTool = false;
-                      contentEmitBuffer = contentEmitBuffer.substring(endIdx + TOOL_END.length);
-                    } else {
-                      // Waiting for TOOL_END, buffer the content
-                      break;
-                    }
-                  }
-                }
-              }
-            }
-          } catch (e) {
-            // parse error, ignore partial chunk
-          }
+              }]
+            })]
+          });
+          emittedToolCallCount++;
+        } else if (type === 'done') {
+          await streamWriter.write('data: [DONE]\n\n');
         }
-      }
+      });
 
-      // Flush any remaining content emit buffer
-      if (!insideTool && contentEmitBuffer.length > 0 && emittedToolCallCount === 0) {
-        await writeEvent({
-          id: completionId,
-          object: 'chat.completion.chunk',
-          created: Math.floor(Date.now() / 1000),
-          model: body.model,
-          choices: [makeChoice({ content: contentEmitBuffer })]
-        });
-      }
-  
-      // Send finish reason
       const usage = {
         prompt_tokens: promptTokens,
         completion_tokens: completionTokens,
         total_tokens: promptTokens + completionTokens,
-        prompt_tokens_details: {
-          cached_tokens: 0 // Mock cache compatibility
-        }
+        prompt_tokens_details: { cached_tokens: 0 }
       };
-  
-      const finalFinishReason = emittedToolCallCount > 0 ? 'tool_calls' : 'stop';
-  
+
       await writeEvent({
-        id: completionId,
-        object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000),
-        model: body.model,
-        choices: [makeChoice({}, finalFinishReason)],
-        usage: usage
+        id: completionId, object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000), model: body.model,
+        choices: [makeChoice({}, emittedToolCallCount > 0 ? 'tool_calls' : 'stop')],
+        usage
       });
       await streamWriter.write('data: [DONE]\n\n');
 

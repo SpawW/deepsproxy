@@ -17,8 +17,16 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 WORKDIR /app
 COPY --from=builder /app/node_modules ./node_modules
-COPY --from=builder /app/dist ./dist
 COPY --from=builder /app/package*.json ./
+
+# Install Playwright browsers before copying application artifacts that
+# change frequently. This keeps the browser download layer cached across
+# rebuilds when only source files change.
 RUN npx playwright install chromium
+
+# Now copy application artifacts (dist/src) last so code changes won't
+# force re-downloading the browser.
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/src ./src
 EXPOSE 3000
 CMD ["node", "dist/index.js"]

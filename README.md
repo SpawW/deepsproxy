@@ -329,7 +329,8 @@ deepsproxy/
 │   ├── index.test.ts        # Testes unitários básicos
 │   └── advanced.test.ts     # Testes de integração avançados
 ├── docker-compose.yml        # Orquestração multi-container
-├── Dockerfile                # Imagem Docker otimizada
+├── Dockerfile.api            # Dockerfile para a imagem da API
+├── Dockerfile.playwright     # Dockerfile para o serviço Playwright
 ├── tsconfig.json            # Configuração TypeScript strict
 ├── package.json             # Dependências e scripts
 ├── .env.example             # Template de variáveis de ambiente

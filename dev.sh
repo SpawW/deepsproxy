@@ -10,15 +10,25 @@
 set -e
 
 CMD="${1:-up}"
+TYPE="${2:-all}"
 
 case "$CMD" in
   up)
     docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
-    echo "Para ver logs: docker logs -f deepsproxy-playwright"
+    echo "Para ver logs: ./dev.sh logs [api|browser|all]"
     ;;
   logs)
-    docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
-    docker logs -f deepsproxy-playwright
+    case "$TYPE" in
+      api)
+        docker logs -f deepsproxy
+        ;;
+      browser)
+        docker logs -f deepsproxy-playwright
+        ;;
+      *)
+        docker compose -f docker-compose.yml -f docker-compose.dev.yml logs -f
+        ;;
+    esac
     ;;
   down)
     docker compose -f docker-compose.yml -f docker-compose.dev.yml down

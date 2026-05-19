@@ -1,7 +1,9 @@
 services:
   deepsproxy:
     container_name: deepsproxy
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.api
     ports:
       - "${PORT:-3000}:${PORT:-3000}"
     env_file:
@@ -15,7 +17,6 @@ services:
       - DISPLAY=${DISPLAY}
       - LOG_LEVEL=${LOG_LEVEL:-info}
     volumes:
-      - ./deepseek_profile:/app/deepseek_profile
       - /tmp/.X11-unix:/tmp/.X11-unix
     devices:
       - /dev/dri:/dev/dri
@@ -25,7 +26,9 @@ services:
     restart: unless-stopped
   playwright:
     container_name: deepsproxy-playwright
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.playwright
     env_file:
       - .env
     environment:

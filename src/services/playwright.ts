@@ -52,6 +52,14 @@ export async function initPlaywright(headless = true) {
     context = await chromium.launchPersistentContext(profilePath, {
       headless,
       userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+      args: [
+        '--disable-blink-features=AutomationControlled',
+        '--exclude-switches=enable-automation',
+        '--disable-infobars',
+        '--no-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+      ],
     });
   } catch (err: any) {
     // If launch still fails due to a lock (race condition or nested lock files),
@@ -62,6 +70,14 @@ export async function initPlaywright(headless = true) {
       context = await chromium.launchPersistentContext(profilePath, {
         headless,
         userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36',
+        args: [
+          '--disable-blink-features=AutomationControlled',
+          '--exclude-switches=enable-automation',
+          '--disable-infobars',
+          '--no-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-gpu',
+        ],
       });
     } else {
       throw err;

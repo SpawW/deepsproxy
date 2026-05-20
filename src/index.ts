@@ -14,10 +14,28 @@ import { cors } from 'hono/cors';
 import { chatCompletions } from './routes/chat.ts';
 import * as dotenv from 'dotenv';
 import { initPlaywright, closePlaywright } from './services/playwright.ts';
+import { getContextLength } from './services/telemetry.ts';
 
 dotenv.config();
 
 export const app = new Hono();
+
+function modelEntry(id: string) {
+  const dynamicLimit = getContextLength(id);
+  return {
+    id,
+    object: 'model',
+    created: Math.floor(Date.now() / 1000),
+    owned_by: 'deepseek',
+    permission: [],
+    root: id,
+    parent: null,
+    context_length: dynamicLimit,
+    max_context_tokens: dynamicLimit,
+    max_input_tokens: dynamicLimit,
+    max_output_tokens: 8_000,
+  };
+}
 
 app.use('*', cors());
 
@@ -52,24 +70,10 @@ app.get('/v1/models', (c) => {
   return c.json({
     object: 'list',
     data: [
-      {
-        id: 'deepseek-thinking',
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'deepseek',
-        permission: [],
-        root: 'deepseek-thinking',
-        parent: null,
-      },
-      {
-        id: 'deepseek-no-thinking',
-        object: 'model',
-        created: Math.floor(Date.now() / 1000),
-        owned_by: 'deepseek',
-        permission: [],
-        root: 'deepseek-no-thinking',
-        parent: null,
-      }
+      modelEntry('deepseek-v4-flash'),
+      modelEntry('deepseek-v4-flash-thinking'),
+      modelEntry('deepseek-v4-pro'),
+      modelEntry('deepseek-v4-pro-thinking')
     ]
   });
 });

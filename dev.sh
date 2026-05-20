@@ -20,6 +20,7 @@ case "$CMD" in
     ;;
   rebuild)
     echo "Rebuilding all containers..."
+    docker rm -f deepsproxy deepsproxy-playwright || true
     docker compose -f docker-compose.yml -f docker-compose.dev.yml build
     docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
     echo "Para ver logs: ./dev.sh logs [api|browser|all]"
